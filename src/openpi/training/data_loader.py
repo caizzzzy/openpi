@@ -2,13 +2,18 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+from datasets import load_dataset
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.common.datasets import utils as lerobot_utils
+from lerobot.common.datasets import video_utils as lerobot_video_utils
 import numpy as np
+import pandas as pd
 import torch
 
 import openpi.models.model as _model
@@ -127,6 +132,131 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class LocalLeRobotV3Dataset(Dataset):
+    """Loads local LeRobot v3 datasets that store metadata as parquet files."""
+
+    def __init__(
+        self,
+        root: pathlib.Path,
+        *,
+        delta_timestamps: dict[str, list[float]] | None = None,
+        video_keys: Sequence[str] | None = None,
+        tolerance_s: float = 1e-4,
+    ):
+        self.root = root
+        self.delta_timestamps = delta_timestamps
+        self.tolerance_s = tolerance_s
+        self.video_backend = "pyav"
+
+        self.info = lerobot_utils.load_info(root)
+        self.fps = self.info["fps"]
+        self.features = self.info["features"]
+        available_video_keys = [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+        self.video_keys = list(video_keys) if video_keys is not None else available_video_keys
+        missing_video_keys = set(self.video_keys) - set(available_video_keys)
+        if missing_video_keys:
+            raise KeyError(f"Local LeRobot dataset is missing video keys: {sorted(missing_video_keys)}")
+
+        tasks_df = pd.read_parquet(root / "meta" / "tasks.parquet")
+        self.tasks = {int(task_index): row["task"] for task_index, row in tasks_df.iterrows()}
+
+        episode_files = sorted((root / "meta" / "episodes").glob("chunk-*/*.parquet"))
+        if not episode_files:
+            raise FileNotFoundError(f"No LeRobot v3 episode metadata files found under: {root / 'meta' / 'episodes'}")
+        episodes_df = pd.concat([pd.read_parquet(path) for path in episode_files]).sort_index()
+        self.episodes = {
+            int(episode_index): {"episode_index": int(episode_index), "length": int(row["length"])}
+            for episode_index, row in episodes_df.iterrows()
+        }
+        self._episodes_df = episodes_df
+
+        self.hf_dataset = load_dataset("parquet", data_dir=str(root / "data"), split="train")
+        self.hf_dataset.set_transform(lerobot_utils.hf_transform_to_torch)
+        self.episode_data_index = lerobot_utils.get_episode_data_index(self.episodes)
+
+        timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
+        episode_indices = torch.stack(self.hf_dataset["episode_index"]).numpy()
+        ep_data_index_np = {key: value.numpy() for key, value in self.episode_data_index.items()}
+        lerobot_utils.check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
+
+        self.delta_indices = None
+        if self.delta_timestamps is not None:
+            lerobot_utils.check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+            self.delta_indices = lerobot_utils.get_delta_indices(self.delta_timestamps, self.fps)
+
+    def _get_video_file_path(self, episode_index: int, video_key: str) -> pathlib.Path:
+        row = self._episodes_df.loc[episode_index]
+        chunk_index = int(row[f"videos/{video_key}/chunk_index"])
+        file_index = int(row[f"videos/{video_key}/file_index"])
+        return self.root / self.info["video_path"].format(
+            video_key=video_key,
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
+
+    def _get_query_indices(self, idx: int, episode_index: int) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
+        ep_start = self.episode_data_index["from"][episode_index]
+        ep_end = self.episode_data_index["to"][episode_index]
+        query_indices = {
+            key: [max(ep_start.item(), min(ep_end.item() - 1, idx + delta)) for delta in delta_idx]
+            for key, delta_idx in self.delta_indices.items()
+        }
+        padding = {
+            f"{key}_is_pad": torch.BoolTensor(
+                [(idx + delta < ep_start.item()) | (idx + delta >= ep_end.item()) for delta in delta_idx]
+            )
+            for key, delta_idx in self.delta_indices.items()
+        }
+        return query_indices, padding
+
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        return {
+            key: torch.stack(self.hf_dataset.select(q_idx)[key])
+            for key, q_idx in query_indices.items()
+            if key not in self.video_keys
+        }
+
+    def _query_videos(
+        self,
+        query_timestamps: dict[str, list[float]],
+        episode_index: int,
+    ) -> dict[str, torch.Tensor]:
+        item = {}
+        for video_key, query_ts in query_timestamps.items():
+            video_path = self._get_video_file_path(episode_index, video_key)
+            frames = lerobot_video_utils.decode_video_frames(
+                video_path, query_ts, self.tolerance_s, self.video_backend
+            )
+            item[video_key] = frames.squeeze(0)
+        return item
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        item = self.hf_dataset[idx]
+        episode_index = item["episode_index"].item()
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(idx, episode_index)
+            item = {**item, **padding, **self._query_hf_dataset(query_indices)}
+
+        if self.video_keys:
+            current_ts = item["timestamp"].item()
+            if query_indices is None:
+                query_timestamps = {video_key: [current_ts] for video_key in self.video_keys}
+            else:
+                query_timestamps = {}
+                for video_key in self.video_keys:
+                    timestamps = self.hf_dataset.select(query_indices.get(video_key, [idx]))["timestamp"]
+                    query_timestamps[video_key] = torch.stack(timestamps).tolist()
+            item = {**self._query_videos(query_timestamps, episode_index), **item}
+
+        return item
+
+    def __len__(self) -> int:
+        return len(self.hf_dataset)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,9 +267,28 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    local_files_dir = (
+        pathlib.Path(data_config.local_files_dir).expanduser().resolve() if data_config.local_files_dir else None
+    )
+    if local_files_dir is not None and not (local_files_dir / "meta").is_dir():
+        raise FileNotFoundError(f"Local LeRobot dataset not found or missing meta directory: {local_files_dir}")
+    if local_files_dir is not None and (local_files_dir / "meta" / "tasks.parquet").is_file():
+        dataset = LocalLeRobotV3Dataset(
+            local_files_dir,
+            delta_timestamps={
+                key: [t / lerobot_utils.load_info(local_files_dir)["fps"] for t in range(action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+            video_keys=data_config.local_video_keys,
+        )
+        if data_config.prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.tasks)])
+        return dataset
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=local_files_dir)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=local_files_dir,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

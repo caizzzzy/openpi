@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.diana_policy as diana_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -65,6 +66,11 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local LeRobot dataset root. If set, data loading reads this directory directly instead of resolving
+    # repo_id under the Hugging Face LeRobot cache or downloading from the Hub.
+    local_files_dir: str | None = None
+    # Optional camera keys to decode for local LeRobot datasets. If None, all video keys are decoded.
+    local_video_keys: Sequence[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -356,6 +362,51 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotDianaDataConfig(DataConfigFactory):
+    # Your dataset stores 7 joint dimensions plus 1 gripper dimension.
+    # If actions are absolute joint targets, keep this true so pi0 learns joint deltas while the gripper stays absolute.
+    use_delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.cam_high",
+                        "observation/global_image": "observation.images.cam_global",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[diana_policy.DianaInputs(model_type=model_config.model_type)],
+            outputs=[diana_policy.DianaOutputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -463,10 +514,29 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class WandBConfig:
+    # If true, will enable wandb logging.
+    enable: bool = True
+    # This project currently logs metrics and media directly, not wandb artifacts. Keep this flag explicit so callers can
+    # share the same config shape as other training projects.
+    disable_artifact: bool = True
+    # WandB project name.
+    project: str = "openpi"
+    # WandB entity (user or team). If None, wandb uses the logged-in default entity.
+    entity: str | None = None
+    # Optional notes attached to the run.
+    notes: str | None = None
+    # WandB mode. Use "offline" to write local runs for later sync, or "disabled" to suppress wandb entirely.
+    mode: Literal["online", "offline", "disabled"] = "online"
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
-    # Project name.
+    # WandB logging config.
+    wandb: WandBConfig = dataclasses.field(default_factory=WandBConfig)
+    # Deprecated: use `wandb.project`. Kept for backward-compatible CLI overrides.
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
@@ -522,7 +592,7 @@ class TrainConfig:
     # If true, will resume training from the last checkpoint.
     resume: bool = False
 
-    # If true, will enable wandb logging.
+    # Deprecated: use `wandb.enable`. Kept for backward-compatible CLI overrides.
     wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
@@ -554,6 +624,15 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        default_wandb_config = WandBConfig()
+        wandb_config = self.wandb
+        if self.project_name != default_wandb_config.project or self.wandb.project == default_wandb_config.project:
+            wandb_config = dataclasses.replace(wandb_config, project=self.project_name)
+        if self.wandb_enabled != default_wandb_config.enable or self.wandb.enable == default_wandb_config.enable:
+            wandb_config = dataclasses.replace(wandb_config, enable=self.wandb_enabled)
+        object.__setattr__(self, "wandb", wandb_config)
+        object.__setattr__(self, "project_name", wandb_config.project)
+        object.__setattr__(self, "wandb_enabled", wandb_config.enable)
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -760,6 +839,61 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning Diana configs.
+    #
+    TrainConfig(
+        name="pi0_diana_pick_place",
+        wandb=WandBConfig(
+            project="openpi",
+            entity="scut-au-415",
+            mode="online",
+            disable_artifact=True,
+        ),
+        model=pi0_config.Pi0Config(),
+        data=LeRobotDianaDataConfig(
+            repo_id="lerobot_dataset_0405_pi0",
+            base_config=DataConfig(
+                local_files_dir="./datasets/lerobot_dataset_0405_pi0",
+                local_video_keys=("observation.images.cam_high", "observation.images.cam_global"),
+                prompt_from_task=True,
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi0_diana_pick_place_lora",
+        wandb=WandBConfig(
+            project="openpi",
+            entity="scut-au-415",
+            mode="online",
+            disable_artifact=True,
+        ),
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotDianaDataConfig(
+            repo_id="lerobot_dataset_0405_pi0",
+            base_config=DataConfig(
+                local_files_dir="./datasets/lerobot_dataset_0405_pi0",
+                local_video_keys=("observation.images.cam_high", "observation.images.cam_global"),
+                prompt_from_task=True,
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1_000,
+        keep_period=5_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.
