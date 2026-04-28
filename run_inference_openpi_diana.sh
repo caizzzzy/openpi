@@ -7,26 +7,27 @@ LEROBOT_DIR="/mnt/nas/projects/robot/lerobot"
 ROS_DISTRO_SETUP="/opt/ros/humble/setup.bash"
 PIKA_ROS_SETUP="/mnt/nas/projects/robot/pika_ros/install/setup.bash"
 PYTHON_BIN=$(command -v python)
+CLIENT_PYTHON_BIN="${SCRIPT_DIR}/.venv-client310/bin/python"
 
 # ==========================================
 # 用户配置区域
 # ==========================================
 
 SERVER_HOST="0.0.0.0"
-CLIENT_HOST="192.168.10.135"
+CLIENT_HOST="127.0.0.1"
 PORT="8080"
 
 ROBOT_PORT="192.168.10.76"
 CONTROL_MODE="joint"
 
-CONFIG_NAME="pi0_diana_pick_place"
-CHECKPOINT_DIR="${SCRIPT_DIR}/checkpoints/pi0_diana_pick_place/my_experiment/20000"
+CONFIG_NAME="pi0_diana_pick_place_lora"
+CHECKPOINT_DIR="${SCRIPT_DIR}/checkpoints/pi0_diana_pick_place_lora/0405_pi0_lora/30000"
 TASK="Pick up the red bell pepper and place it into the box"
 
 ACTION_HORIZON=50
 MAX_HZ=30
 MAX_EPISODE_STEPS=0
-DRY_RUN=True
+DRY_RUN=False
 
 IMAGE_TOPIC="/camera/color/image_raw"
 IMAGE_TOPIC_FISHEYE="/camera_fisheye/color/image_raw"
@@ -60,12 +61,12 @@ if [ "$MODE" == "server" ]; then
     echo "=========================================="
 
     cd "${SCRIPT_DIR}"
-    uv run scripts/serve_policy.py \
+    "$PYTHON_BIN" scripts/serve_policy.py \
+        --port="${PORT}" \
+        --default-prompt="${TASK}" \
         policy:checkpoint \
         --policy.config="${CONFIG_NAME}" \
-        --policy.dir="${CHECKPOINT_DIR}" \
-        --port="${PORT}" \
-        --default_prompt="${TASK}"
+        --policy.dir="${CHECKPOINT_DIR}"
 
 elif [ "$MODE" == "client" ]; then
     if [ -f "$ROS_DISTRO_SETUP" ]; then
@@ -82,11 +83,18 @@ elif [ "$MODE" == "client" ]; then
     export LD_LIBRARY_PATH="/opt/ros/humble/lib:${LD_LIBRARY_PATH}"
     export PYTHONPATH="/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:${PYTHONPATH}"
 
+    if [ ! -x "${CLIENT_PYTHON_BIN}" ]; then
+        echo "未找到 client 专用 Python: ${CLIENT_PYTHON_BIN}"
+        echo "请先运行: ./setup_diana_client_env.sh"
+        exit 1
+    fi
+
     echo "=========================================="
     echo "正在启动 Diana 真机客户端..."
     echo "连接至 OpenPI server: ${CLIENT_HOST}:${PORT}"
     echo "机器人: ${ROBOT_PORT} (${CONTROL_MODE})"
     echo "Dry run: ${DRY_RUN}"
+    echo "Client Python: ${CLIENT_PYTHON_BIN}"
     echo "=========================================="
 
     DRY_RUN_ARG="--dry-run"
@@ -94,7 +102,7 @@ elif [ "$MODE" == "client" ]; then
         DRY_RUN_ARG="--no-dry-run"
     fi
 
-    "$PYTHON_BIN" -m examples.diana_real.main \
+    "$CLIENT_PYTHON_BIN" -m examples.diana_real.main \
         --host="${CLIENT_HOST}" \
         --port="${PORT}" \
         --robot-port="${ROBOT_PORT}" \

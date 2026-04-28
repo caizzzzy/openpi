@@ -1,5 +1,8 @@
 import dataclasses
+import importlib.util
 import logging
+import sys
+import types
 from typing import Any
 
 import numpy as np
@@ -12,6 +15,40 @@ logger = logging.getLogger(__name__)
 
 JOINT_NAMES = tuple(f"joint_{i}.pos" for i in range(7))
 GRIPPER_NAME = "gripper.pos"
+
+
+def _ensure_pytorch3d_transforms_stub() -> None:
+    """LeRobot's DianaFollower imports pytorch3d transforms, but does not use them."""
+    pytorch3d_spec = importlib.util.find_spec("pytorch3d")
+    if pytorch3d_spec is not None:
+        return
+
+    pytorch3d_module = types.ModuleType("pytorch3d")
+    transforms_module = types.ModuleType("pytorch3d.transforms")
+
+    def _missing(*_args, **_kwargs):
+        raise RuntimeError("pytorch3d is not installed in the Diana client environment.")
+
+    transforms_module.matrix_to_rotation_6d = _missing
+    transforms_module.rotation_6d_to_matrix = _missing
+    pytorch3d_module.transforms = transforms_module
+    sys.modules["pytorch3d"] = pytorch3d_module
+    sys.modules["pytorch3d.transforms"] = transforms_module
+
+
+def _ensure_diana_sdk_alias() -> None:
+    """Map the locally installed `diana_robot` package to the import path expected by LeRobot."""
+    if importlib.util.find_spec("diana_sdk") is not None:
+        return
+    if importlib.util.find_spec("diana_robot") is None:
+        return
+
+    import diana_robot
+
+    diana_sdk_module = types.ModuleType("diana_sdk")
+    diana_sdk_module.diana_robot = diana_robot
+    sys.modules["diana_sdk"] = diana_sdk_module
+    sys.modules["diana_sdk.diana_robot"] = diana_robot
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +85,9 @@ class DianaRealEnvironment(_environment.Environment):
         self._dry_run = dry_run
         self._render_height = render_height
         self._render_width = render_width
+
+        _ensure_pytorch3d_transforms_stub()
+        _ensure_diana_sdk_alias()
 
         try:
             from lerobot.robots.diana_follower import DianaFollower
@@ -91,9 +131,9 @@ class DianaRealEnvironment(_environment.Environment):
         state = np.asarray([raw_obs[name] for name in (*JOINT_NAMES, GRIPPER_NAME)], dtype=np.float32)
 
         obs = {
-            "observation.state": state,
-            "observation.images.cam_high": self._prepare_image(raw_obs["cam_high"]),
-            "observation.images.cam_global": self._prepare_image(raw_obs["cam_global"]),
+            "observation/state": state,
+            "observation/image": self._prepare_image(raw_obs["cam_high"]),
+            "observation/global_image": self._prepare_image(raw_obs["cam_global"]),
         }
         if self._prompt:
             obs["prompt"] = self._prompt

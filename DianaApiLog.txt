@@ -1,0 +1,11 @@
+ [Info] [CRobotApiSystem::createRobotApi]create ok:192.168.10.76,initRef:1
+ [Info] [CSessionUDP::initSession] ret： 1 session type: 0 local ip-port: 0.0.0.0-5003,remoteipPort:-5003
+ [Info] [CSessionUDP::initSession] ret： 1 session type: 1 local ip-port: 0.0.0.0-5002,remoteipPort:-5002
+ [Info] [CSessionUDP::initSession] ret： 1 session type: 2 local ip-port: 0.0.0.0-5001,remoteipPort:-5001
+ [Info] [CSessionUDP::initSession] ret： 1 session type: 3 local ip-port: 0.0.0.0-5004,remoteipPort:-5004
+ [Info] [CSessionUDP::initSession] ret： 1 session type: 4 local ip-port: 0.0.0.0-5005,remoteipPort:-5005
+ [Info] [CThreadProcessorBase::start] start thread processor
+ [Info] [CThreadProcessorBase::start] start thread processor
+ [Warning] -20001:_interpolaterPosition warning:SPD_LIMIT_TRAJ.
+ [Info] [CRobotApiImp::requestJointCount] joint cout is  7
+ [Info] [CRobotApiSystem::initRobotApi]init default ip:192.168.10.76
